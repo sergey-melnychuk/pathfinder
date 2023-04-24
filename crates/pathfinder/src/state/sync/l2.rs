@@ -2,11 +2,12 @@ use crate::state::block_hash::{verify_block_hash, VerifyResult};
 use crate::state::sync::pending;
 use anyhow::{anyhow, Context};
 use pathfinder_common::{
-    CasmHash, Chain, ClassHash, EventCommitment, StarknetBlockHash, StarknetBlockNumber,
+    BlockId, CasmHash, Chain, ClassHash, EventCommitment, StarknetBlockHash, StarknetBlockNumber,
     StateCommitment, TransactionCommitment,
 };
 use pathfinder_storage::types::{CompressedCasmClass, CompressedContract};
 use starknet_gateway_client::ClientApi;
+use starknet_gateway_types::reply::MaybePendingBlock;
 use starknet_gateway_types::{
     class_hash::compute_class_hash,
     error::SequencerError,
@@ -67,7 +68,8 @@ pub async fn sync(
     pending_poll_interval: Option<Duration>,
     block_validation_mode: BlockValidationMode,
 ) -> anyhow::Result<()> {
-    use crate::state::sync::head_poll_interval;
+    use starknet_gateway_types::error::StarknetErrorCode::BlockNotFound;
+    let poll_interval = crate::state::sync::head_poll_interval(chain);
 
     'outer: loop {
         // Get the next block from L2.
@@ -75,80 +77,69 @@ pub async fn sync(
             Some(head) => (head.0 + 1, Some(head)),
             None => (StarknetBlockNumber::GENESIS, None),
         };
-        let t_block = std::time::Instant::now();
+
         // Next block and state update which we can get for free when exiting poll pending mode
-        let mut next_block = None;
+        let mut next_block: Option<Block> = None;
         let mut next_state_update = None;
 
+        let t_block = std::time::Instant::now();
         let (block, commitments) = loop {
-            match download_block(
-                next,
-                // Reuse the next full block if we got it for free when polling pending
-                std::mem::take(&mut next_block),
-                chain,
-                head_meta.map(|h| h.1),
-                &sequencer,
-                block_validation_mode,
-            )
-            .await?
+            let block = if let Some(block) =
+                next_block.take().filter(|block| block.block_number == next)
             {
-                DownloadBlock::Block(block, commitments) => break (block, commitments),
-                DownloadBlock::AtHead => {
-                    // Poll pending if it is enabled, otherwise just wait to poll head again.
-                    match pending_poll_interval {
-                        Some(interval) => {
-                            tracing::trace!("Entering pending mode");
-                            let head = head_meta
-                                .expect("Head hash should exist when entering pending mode");
-                            (next_block, next_state_update) = pending::poll_pending(
-                                tx_event.clone(),
-                                &sequencer,
-                                (head.1, head.2),
-                                interval,
-                            )
-                            .await
-                            .context("Polling pending block")?;
+                block
+            } else {
+                match sequencer.block(next.into()).await {
+                    Ok(MaybePendingBlock::Block(block)) => block,
+                    Ok(MaybePendingBlock::Pending(_)) => {
+                        anyhow::bail!("Sequencer returned `pending` block")
+                    }
+                    Err(SequencerError::StarknetError(err)) => {
+                        if err.code == BlockNotFound {
+                            let prev_block_hash = head_meta.map(|h| h.1);
+                            if is_reorg_required(next, prev_block_hash, &sequencer).await? {
+                                let some_head = head.unwrap();
+                                head = reorg(some_head, &tx_event, &sequencer)
+                                    .await
+                                    .context("L2 reorg")?;
+                            }
                         }
-                        None => {
-                            let poll_interval = head_poll_interval(chain);
-                            tracing::info!(poll_interval=?poll_interval, "At head of chain");
-                            tokio::time::sleep(poll_interval).await;
+                        match pending_poll_interval {
+                            Some(interval) => {
+                                tracing::trace!("Entering pending mode");
+                                let head = head_meta
+                                    .expect("Head hash should exist when entering pending mode");
+                                if let Ok(pending) = pending::poll_pending(
+                                    tx_event.clone(),
+                                    &sequencer,
+                                    (head.1, head.2),
+                                    interval,
+                                )
+                                .await
+                                .context("Polling pending block")
+                                {
+                                    (next_block, next_state_update) = pending;
+                                }
+                            }
+                            None => {
+                                tracing::info!(poll_interval=?poll_interval, "At head of chain");
+                                tokio::time::sleep(poll_interval).await;
+                            }
                         }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error=?e, "Sequencer request failed");
+                        // TODO(SM): exponential backoff in case of failure?
+                        continue 'outer;
                     }
                 }
-                DownloadBlock::Reorg => {
-                    let some_head = head.unwrap();
-                    head = reorg(
-                        some_head,
-                        chain,
-                        &tx_event,
-                        &sequencer,
-                        block_validation_mode,
-                    )
-                    .await
-                    .context("L2 reorg")?;
+            };
 
-                    continue 'outer;
-                }
-            }
+            let (block, commitments) = check_block(block, chain, block_validation_mode).await?;
+            break (block, commitments);
         };
         let t_block = t_block.elapsed();
-
-        if let Some(some_head) = head {
-            if some_head.1 != block.parent_block_hash {
-                head = reorg(
-                    some_head,
-                    chain,
-                    &tx_event,
-                    &sequencer,
-                    block_validation_mode,
-                )
-                .await
-                .context("L2 reorg")?;
-
-                continue 'outer;
-            }
-        }
 
         // Unwrap in both block and state update is safe as the block hash always exists (unless we query for pending).
         let block_hash = block.block_hash;
@@ -321,12 +312,6 @@ async fn download_new_classes(
     Ok(())
 }
 
-enum DownloadBlock {
-    Block(Box<Block>, (TransactionCommitment, EventCommitment)),
-    AtHead,
-    Reorg,
-}
-
 #[derive(Copy, Clone, Default)]
 pub enum BlockValidationMode {
     #[default]
@@ -336,102 +321,68 @@ pub enum BlockValidationMode {
     AllowMismatch,
 }
 
-async fn download_block(
-    block_number: StarknetBlockNumber,
-    // Poll pending could exit when it encountered a finalized block, so we'd like to reuse it
-    next_block: Option<Block>,
+async fn check_block(
+    block: Block,
     chain: Chain,
+    mode: BlockValidationMode,
+) -> anyhow::Result<(Box<Block>, (TransactionCommitment, EventCommitment))> {
+    let block = Box::new(block);
+
+    let expected_block_hash = block.block_hash;
+    let verify_hash = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let block_number = block.block_number;
+        let verify_result = verify_block_hash(&block, chain, expected_block_hash)
+            .with_context(move || format!("Verify block {block_number}"))?;
+        Ok((block, verify_result))
+    });
+    let (block, verify_result) = verify_hash.await.context("Verify block hash")??;
+    match (block.status, verify_result, mode) {
+        (Status::AcceptedOnL1 | Status::AcceptedOnL2, VerifyResult::Match(commitments), _) => {
+            Ok((block, commitments))
+        }
+        (Status::AcceptedOnL1 | Status::AcceptedOnL2, VerifyResult::NotVerifiable, _) => {
+            Ok((block, Default::default()))
+        }
+        (
+            Status::AcceptedOnL1 | Status::AcceptedOnL2,
+            VerifyResult::Mismatch,
+            BlockValidationMode::AllowMismatch,
+        ) => Ok((block, Default::default())),
+        (_, VerifyResult::Mismatch, BlockValidationMode::Strict) => {
+            Err(anyhow!("Block hash mismatch"))
+        }
+        _ => Err(anyhow!(
+            "Rejecting block as its status is {}, and only accepted blocks are allowed",
+            block.status
+        )),
+    }
+}
+
+async fn is_reorg_required(
+    block_number: StarknetBlockNumber,
     prev_block_hash: Option<StarknetBlockHash>,
     sequencer: &impl ClientApi,
-    mode: BlockValidationMode,
-) -> anyhow::Result<DownloadBlock> {
-    use pathfinder_common::BlockId;
-    use starknet_gateway_types::{
-        error::StarknetErrorCode::BlockNotFound, reply::MaybePendingBlock,
-    };
+) -> anyhow::Result<bool> {
+    // This would occur if we queried past the head of the chain. We now need to check that
+    // a reorg hasn't put us too far in the future. This does run into race conditions with
+    // the sequencer but this is the best we can do I think.
+    let latest = sequencer
+        .block(BlockId::Latest)
+        .await
+        .context("Query sequencer for latest block")?
+        .as_block()
+        .context("Latest block is `pending`")?;
 
-    let result = match next_block {
-        // Reuse a finalized block downloaded before pending mode exited
-        Some(block) if block.block_number == block_number => Ok(MaybePendingBlock::Block(block)),
-        // Bad luck or poll pending is disabled
-        Some(_) | None => sequencer.block(block_number.into()).await,
-    };
-
-    match result {
-        Ok(MaybePendingBlock::Block(block)) => {
-            let block = Box::new(block);
-            // Check if block hash is correct.
-            let expected_block_hash = block.block_hash;
-            let verify_hash = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let block_number = block.block_number;
-                let verify_result = verify_block_hash(&block, chain, expected_block_hash)
-                    .with_context(move || format!("Verify block {block_number}"))?;
-                Ok((block, verify_result))
-            });
-            let (block, verify_result) = verify_hash.await.context("Verify block hash")??;
-            match (block.status, verify_result, mode) {
-                (
-                    Status::AcceptedOnL1 | Status::AcceptedOnL2,
-                    VerifyResult::Match(commitments),
-                    _,
-                ) => Ok(DownloadBlock::Block(block, commitments)),
-                (Status::AcceptedOnL1 | Status::AcceptedOnL2, VerifyResult::NotVerifiable, _) => {
-                    Ok(DownloadBlock::Block(block, Default::default()))
-                }
-                (
-                    Status::AcceptedOnL1 | Status::AcceptedOnL2,
-                    VerifyResult::Mismatch,
-                    BlockValidationMode::AllowMismatch,
-                ) => Ok(DownloadBlock::Block(block, Default::default())),
-                (_, VerifyResult::Mismatch, BlockValidationMode::Strict) => {
-                    Err(anyhow!("Block hash mismatch"))
-                }
-                _ => Err(anyhow!(
-                    "Rejecting block as its status is {}, and only accepted blocks are allowed",
-                    block.status
-                )),
-            }
-        }
-        Ok(MaybePendingBlock::Pending(_)) => anyhow::bail!("Sequencer returned `pending` block"),
-        Err(SequencerError::StarknetError(err)) if err.code == BlockNotFound => {
-            // This would occur if we queried past the head of the chain. We now need to check that
-            // a reorg hasn't put us too far in the future. This does run into race conditions with
-            // the sequencer but this is the best we can do I think.
-            let latest = sequencer
-                .block(BlockId::Latest)
-                .await
-                .context("Query sequencer for latest block")?
-                .as_block()
-                .context("Latest block is `pending`")?;
-
-            if latest.block_number + 1 == block_number {
-                match prev_block_hash {
-                    // We are definitely still at the head and it's just that a new block
-                    // has not been published yet
-                    Some(parent_block_hash) if parent_block_hash == latest.block_hash => {
-                        Ok(DownloadBlock::AtHead)
-                    }
-                    // Our head is not valid anymore so there must have been a reorg only at this height
-                    Some(_) => Ok(DownloadBlock::Reorg),
-                    // There is something wrong with the sequencer, as we are attempting to get the genesis block
-                    // Let's retry in a while
-                    None => Ok(DownloadBlock::AtHead),
-                }
-            } else {
-                // The new head is at lower height than our head which means there must have been a reorg
-                Ok(DownloadBlock::Reorg)
-            }
-        }
-        Err(other) => Err(other).context("Download block from sequencer"),
-    }
+    Ok((latest.block_number != block_number)
+        || prev_block_hash
+            .map(|h| h != latest.block_hash)
+            .unwrap_or_default())
 }
 
 async fn reorg(
     head: (StarknetBlockNumber, StarknetBlockHash, StateCommitment),
-    chain: Chain,
     tx_event: &mpsc::Sender<Event>,
     sequencer: &impl ClientApi,
-    mode: BlockValidationMode,
 ) -> anyhow::Result<Option<(StarknetBlockNumber, StarknetBlockHash, StateCommitment)>> {
     // Go back in history until we find an L2 block that does still exist.
     // We already know the current head is invalid.
@@ -444,35 +395,26 @@ async fn reorg(
 
         let previous_block_number = reorg_tail.0 - 1;
 
+        let block = match sequencer.block(previous_block_number.into()).await? {
+            MaybePendingBlock::Block(block) => block,
+            MaybePendingBlock::Pending(_) => anyhow::bail!("Sequencer returned `pending` block"),
+        };
+
+        // TODO(SM): Use `Storage` in `l2::sync` get rid of `l2::Event::Query*` workaround
         let (tx, rx) = oneshot::channel();
         tx_event
             .send(Event::QueryBlock(previous_block_number, tx))
             .await
             .context("Event channel closed")?;
 
-        let previous = match rx.await.context("Oneshot channel closed")? {
-            Some(hash) => hash,
-            None => break None,
-        };
-
-        match download_block(
-            previous_block_number,
-            None,
-            chain,
-            Some(previous.0),
-            sequencer,
-            mode,
-        )
-        .await
-        .with_context(|| format!("Download block {previous_block_number} from sequencer"))?
-        {
-            DownloadBlock::Block(block, _) if block.block_hash == previous.0 => {
-                break Some((previous_block_number, previous.0, previous.1));
+        if let Some((block_hash, block_root)) = rx.await.context("Oneshot channel closed")? {
+            reorg_tail = (previous_block_number, block_hash, block_root);
+            if block.block_hash == block_hash {
+                break Some(reorg_tail);
             }
-            _ => {}
-        };
-
-        reorg_tail = (previous_block_number, previous.0, previous.1);
+        } else {
+            break None;
+        }
     };
 
     let reorg_tail = new_head

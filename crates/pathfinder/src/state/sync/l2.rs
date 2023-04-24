@@ -102,6 +102,7 @@ pub async fn sync(
                                 head = reorg(some_head, &tx_event, &sequencer)
                                     .await
                                     .context("L2 reorg")?;
+                                continue 'outer;
                             }
                         }
                         match pending_poll_interval {
@@ -140,6 +141,15 @@ pub async fn sync(
             break (block, commitments);
         };
         let t_block = t_block.elapsed();
+
+        if let Some((_, head_block_hash, _)) = head {
+            if head_block_hash != block.parent_block_hash {
+                head = reorg(head.unwrap(), &tx_event, &sequencer)
+                    .await
+                    .context("L2 reorg")?;
+                continue 'outer;
+            }
+        }
 
         // Unwrap in both block and state update is safe as the block hash always exists (unless we query for pending).
         let block_hash = block.block_hash;
@@ -523,6 +533,15 @@ async fn download_and_compress_class(
         }
     }
 }
+
+// FIXME TODO(SM): These tests cement existing impl instead of validating invariants
+
+// TODO(SM): Refactor further until test assertions can be made without hard-coded mocking
+
+// Suggestion: reduce of infinite stream of events (event == response from the sequencer), 
+// with each event extended and mapped along the way (e.g. reorg - into Reorg(new_head), 
+// new block - into Block(block,commitments,classes,state_update,...)).
+// Then testing is a simple assertion from sequencer events mapped to L2 events.
 
 #[cfg(test)]
 mod tests {
